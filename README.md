@@ -6,6 +6,7 @@ Los jugadores deben deducir quién es el asesino mientras colaboran, debaten y v
 
 ## Objetivo del proyecto
 Desarrollar un juego accesible, dinámico y jugable desde navegador, con salas privadas y comunicación en tiempo real.
+image-CyD7VUDnxviddGiCTfXWW.webp
 
 ##  Sprint 1 – Objetivo
 Configurar la base técnica del proyecto y permitir:
