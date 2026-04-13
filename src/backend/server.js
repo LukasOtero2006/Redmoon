@@ -29,6 +29,35 @@ class LobbyServer {
         });
     }
 
+    sendRoomState(room) {
+        this.broadcast(room, {
+            type: "roomState",
+            ...room.getState()
+        });
+    }
+
+    sendUserProfile(userId) {
+        const targetSocket = this.playerSessions.get(userId);
+        const user = this.userManager.getUserById(userId);
+
+        if (!targetSocket || !user) {
+            return;
+        }
+
+        targetSocket.send(JSON.stringify({
+            type: "profileUpdate",
+            user: this.userManager.toClientUser(user)
+        }));
+    }
+
+    roomFromSession(ws) {
+        if (!ws.session || !ws.session.roomCode) {
+            return null;
+        }
+
+        return this.roomManager.getRoom(ws.session.roomCode);
+    }
+
     removePlayerFromRoom(ws) {
         if (!ws.session || !ws.session.roomCode || !ws.session.playerId) {
             return;
@@ -48,6 +77,7 @@ class LobbyServer {
             this.roomManager.deleteRoom(room.code);
         } else {
             this.sendPlayerList(room);
+            this.sendRoomState(room);
         }
 
         delete ws.session.roomCode;
@@ -153,6 +183,26 @@ class LobbyServer {
             return;
         }
 
+        if (msg.type === "respondFriendRequest") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            const fromUserId = String(msg.fromUserId || "").trim();
+            const accept = Boolean(msg.accept);
+            const result = this.userManager.respondFriendRequest(ws.session.userId, fromUserId, accept);
+
+            if (!result.success) {
+                ws.send(JSON.stringify({ type: "error", message: result.message }));
+                return;
+            }
+
+            this.sendUserProfile(ws.session.userId);
+            this.sendUserProfile(fromUserId);
+            return;
+        }
+
         if (msg.type === "leaveRoom") {
             if (!ws.session) {
                 ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
@@ -185,6 +235,7 @@ class LobbyServer {
             }));
 
             this.sendPlayerList(room);
+            this.sendRoomState(room);
             return;
         }
 
@@ -211,7 +262,13 @@ class LobbyServer {
             }
 
             const player = new Player(ws.session.userId, ws.session.username, ws);
-            room.addPlayer(player);
+            const joinResult = room.addPlayer(player);
+
+            if (!joinResult.success) {
+                ws.send(JSON.stringify({ type: "error", message: joinResult.message }));
+                return;
+            }
+
             ws.session.roomCode = roomCode;
             ws.session.playerId = player.id;
 
@@ -223,6 +280,211 @@ class LobbyServer {
             }));
 
             this.sendPlayerList(room);
+            this.sendRoomState(room);
+            ws.send(JSON.stringify({
+                type: "roomChatHistory",
+                messages: room.chatMessages
+            }));
+            return;
+        }
+
+        if (msg.type === "setNickname") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            const room = this.roomFromSession(ws);
+
+            if (!room) {
+                ws.send(JSON.stringify({ type: "error", message: "No estas en una sala" }));
+                return;
+            }
+
+            const result = room.setPlayerNickname(ws.session.userId, msg.nickname);
+
+            if (!result.success) {
+                ws.send(JSON.stringify({ type: "error", message: result.message }));
+                return;
+            }
+
+            this.sendPlayerList(room);
+            return;
+        }
+
+        if (msg.type === "sendRoomChat") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            const room = this.roomFromSession(ws);
+
+            if (!room) {
+                ws.send(JSON.stringify({ type: "error", message: "No estas en una sala" }));
+                return;
+            }
+
+            const result = room.addChatMessage(ws.session.userId, msg.text);
+
+            if (!result.success) {
+                ws.send(JSON.stringify({ type: "error", message: result.message }));
+                return;
+            }
+
+            this.broadcast(room, {
+                type: "roomChatMessage",
+                message: result.message
+            });
+            return;
+        }
+
+        if (msg.type === "sendFriendRequest") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            const toUserId = String(msg.toUserId || "").trim();
+            const room = this.roomFromSession(ws);
+
+            if (!room) {
+                ws.send(JSON.stringify({ type: "error", message: "Solo puedes enviar solicitudes dentro de una sala" }));
+                return;
+            }
+
+            const targetInRoom = room.players.some((p) => p.id === toUserId);
+
+            if (!targetInRoom) {
+                ws.send(JSON.stringify({ type: "error", message: "Solo puedes solicitar amistad a jugadores de tu sala" }));
+                return;
+            }
+
+            const result = this.userManager.sendFriendRequest(ws.session.userId, toUserId);
+
+            if (!result.success) {
+                ws.send(JSON.stringify({ type: "error", message: result.message }));
+                return;
+            }
+
+            this.sendUserProfile(ws.session.userId);
+            this.sendUserProfile(toUserId);
+
+            const requester = this.userManager.getUserById(ws.session.userId);
+            const targetSocket = this.playerSessions.get(toUserId);
+
+            if (requester && targetSocket && targetSocket.readyState === 1) {
+                targetSocket.send(JSON.stringify({
+                    type: "friendRequestReceived",
+                    fromUser: {
+                        userId: requester.userId,
+                        username: requester.username
+                    }
+                }));
+            }
+
+            ws.send(JSON.stringify({ type: "info", message: "Solicitud enviada" }));
+            return;
+        }
+
+        if (msg.type === "updateRoomSettings") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            const room = this.roomFromSession(ws);
+
+            if (!room) {
+                ws.send(JSON.stringify({ type: "error", message: "No estas en una sala" }));
+                return;
+            }
+
+            const result = room.updateSettings(ws.session.userId, msg.settings || {});
+
+            if (!result.success) {
+                ws.send(JSON.stringify({ type: "error", message: result.message }));
+                return;
+            }
+
+            this.sendRoomState(room);
+            return;
+        }
+
+        if (msg.type === "startGame") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            const room = this.roomFromSession(ws);
+
+            if (!room) {
+                ws.send(JSON.stringify({ type: "error", message: "No estas en una sala" }));
+                return;
+            }
+
+            const result = room.startGame(ws.session.userId);
+
+            if (!result.success) {
+                ws.send(JSON.stringify({ type: "error", message: result.message }));
+                return;
+            }
+
+            this.sendRoomState(room);
+            this.sendPlayerList(room);
+            this.broadcast(room, {
+                type: "roomChatHistory",
+                messages: []
+            });
+
+            room.players.forEach((player) => {
+                if (player.ws.readyState === 1) {
+                    player.ws.send(JSON.stringify({
+                        type: "gameStarted",
+                        phase: room.gamePhase,
+                        role: result.playerRoles[player.id] || "Aldeano"
+                    }));
+                }
+            });
+
+            this.broadcast(room, {
+                type: "roomChatMessage",
+                message: {
+                    senderId: "system",
+                    senderName: "Sistema",
+                    text: "La partida ha comenzado. Los motes quedan bloqueados.",
+                    sentAt: new Date().toISOString()
+                }
+            });
+            return;
+        }
+
+        if (msg.type === "setGamePhase") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            const room = this.roomFromSession(ws);
+
+            if (!room) {
+                ws.send(JSON.stringify({ type: "error", message: "No estas en una sala" }));
+                return;
+            }
+
+            const result = room.setGamePhase(ws.session.userId, String(msg.phase || "").trim());
+
+            if (!result.success) {
+                ws.send(JSON.stringify({ type: "error", message: result.message }));
+                return;
+            }
+
+            this.sendRoomState(room);
+            this.broadcast(room, {
+                type: "info",
+                message: room.gamePhase === "night" ? "Comienza la noche" : "Amanece: empieza el dia"
+            });
             return;
         }
 
@@ -256,6 +518,7 @@ class LobbyServer {
             }
 
             this.sendPlayerList(room);
+            this.sendRoomState(room);
             return;
         }
 
