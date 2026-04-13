@@ -14,3 +14,15 @@ Configurar la base técnica del proyecto y permitir:
 - Unirse mediante código
 - Ver jugadores conectados en tiempo real
 
+## Sptrint 2 -Objetivo 
+que el juego pueda empezar.
+
+Asignación automática de roles (Lobo, Aldeano, Vidente, Bruja…)
+
+Enviar a cada jugador su rol de forma privada
+
+Mostrar en la interfaz que la partida está “lista”
+
+Control de host (solo el creador puede iniciar)
+
+Resultado: cada jugador sabe qué rol tiene y el host puede iniciar la partida.
