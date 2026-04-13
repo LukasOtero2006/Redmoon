@@ -30,9 +30,15 @@ Resultado: cada jugador sabe qué rol tiene y el host puede iniciar la partida.
 
 ## Sprint 3 - Objetivo
 Implementar todas las mecánicas del juego:
+
 Fases
+
 Acciones de roles
+
 Resolución de eventos
+
 Muertes
+
 Votaciones
+
 Avance automático de turnos
