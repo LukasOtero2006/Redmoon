@@ -1,5 +1,4 @@
 import { WebSocketServer } from "ws";
-import { randomUUID } from "crypto";
 import { Player } from "./classes/Player.js";
 import { RoomManager } from "./classes/RoomManager.js";
 import { UserManager } from "./classes/UserManager.js";
@@ -31,14 +30,15 @@ class LobbyServer {
     }
 
     removePlayerFromRoom(ws) {
-        if (!ws.session) {
+        if (!ws.session || !ws.session.roomCode || !ws.session.playerId) {
             return;
         }
 
         const room = this.roomManager.getRoom(ws.session.roomCode);
 
         if (!room) {
-            ws.session = null;
+            delete ws.session.roomCode;
+            delete ws.session.playerId;
             return;
         }
 
@@ -50,12 +50,14 @@ class LobbyServer {
             this.sendPlayerList(room);
         }
 
-        ws.session = null;
+        delete ws.session.roomCode;
+        delete ws.session.playerId;
     }
 
     start() {
         this.wss.on("connection", (ws) => {
             ws.session = null;
+            console.log("[SERVER] Nueva conexion WebSocket establecida");
 
             ws.on("message", (data) => this.handleMessage(ws, data));
             ws.on("close", () => this.handleClose(ws));
@@ -64,7 +66,7 @@ class LobbyServer {
 
     parseMessage(ws, data) {
         try {
-            return JSON.parse(data);
+            return JSON.parse(data.toString());
         } catch {
             ws.send(JSON.stringify({ type: "error", message: "Mensaje invalido" }));
             return null;
@@ -79,20 +81,41 @@ class LobbyServer {
         }
 
         if (msg.type === "register") {
-            const { username, email, password } = msg;
+            const username = String(msg.username || "").trim();
+            const email = String(msg.email || "").trim().toLowerCase();
+            const password = String(msg.password || "").trim();
+            console.log(`[REGISTER] Recibido: usuario=${username}, email=${email}, pass=${password ? password.length + ' chars' : 'undefined'}`);
 
             if (!username || !email || !password) {
+                console.log("[REGISTER] Error: campos vacios");
                 ws.send(JSON.stringify({ type: "error", message: "Rellena todos los campos" }));
+                return;
+            }
+
+            if (username.length < 3) {
+                ws.send(JSON.stringify({ type: "error", message: "Usuario: minimo 3 caracteres" }));
+                return;
+            }
+
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                ws.send(JSON.stringify({ type: "error", message: "Email invalido" }));
+                return;
+            }
+
+            if (password.length < 6) {
+                ws.send(JSON.stringify({ type: "error", message: "Contraseña: minimo 6 caracteres" }));
                 return;
             }
 
             const result = this.userManager.register(username, email, password);
 
             if (!result.success) {
+                console.log(`[REGISTER] Error: ${result.message}`);
                 ws.send(JSON.stringify({ type: "error", message: result.message }));
                 return;
             }
 
+            console.log(`[REGISTER] Exito: usuario ${username} registrado`);
             ws.send(JSON.stringify({
                 type: "registerSuccess",
                 user: result.user
@@ -101,27 +124,43 @@ class LobbyServer {
         }
 
         if (msg.type === "login") {
-            const { username, password } = msg;
+            const identifier = String(msg.username || "").trim();
+            const password = String(msg.password || "").trim();
+            console.log(`[LOGIN] Recibido: identificador=${identifier}, pass=${password ? password.length + ' chars' : 'undefined'}`);
 
-            if (!username || !password) {
-                ws.send(JSON.stringify({ type: "error", message: "Usuario y contraseña requeridos" }));
+            if (!identifier || !password) {
+                console.log("[LOGIN] Error: campos vacios");
+                ws.send(JSON.stringify({ type: "error", message: "Usuario/email y contraseña requeridos" }));
                 return;
             }
 
-            const result = this.userManager.login(username, password);
+            const result = this.userManager.login(identifier, password);
 
             if (!result.success) {
+                console.log(`[LOGIN] Error: ${result.message}`);
                 ws.send(JSON.stringify({ type: "error", message: result.message }));
                 return;
             }
 
-            ws.session = { userId: result.user.userId, username };
+            ws.session = { userId: result.user.userId, username: result.user.username };
             this.playerSessions.set(result.user.userId, ws);
 
+            console.log(`[LOGIN] Exito: usuario ${result.user.username} logueado`);
             ws.send(JSON.stringify({
                 type: "loginSuccess",
                 user: result.user
             }));
+            return;
+        }
+
+        if (msg.type === "leaveRoom") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            this.removePlayerFromRoom(ws);
+            ws.send(JSON.stringify({ type: "leftRoom" }));
             return;
         }
 
@@ -150,7 +189,7 @@ class LobbyServer {
         }
 
         if (msg.type === "joinRoom") {
-            const roomCode = String(msg.roomCode || "").trim().toUpperCase();
+            const { roomCode } = msg;
 
             if (!ws.session) {
                 ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
@@ -162,18 +201,18 @@ class LobbyServer {
                 return;
             }
 
-            if (!this.roomManager.roomExists(roomCode)) {
-                ws.send(JSON.stringify({ type: "error", message: "Sala no existe" }));
-                return;
-            }
-
             this.removePlayerFromRoom(ws);
 
             const room = this.roomManager.getRoom(roomCode);
-            const player = new Player(ws.session.userId, ws.session.username, ws);
 
+            if (!room) {
+                ws.send(JSON.stringify({ type: "error", message: "Sala no encontrada" }));
+                return;
+            }
+
+            const player = new Player(ws.session.userId, ws.session.username, ws);
             room.addPlayer(player);
-            ws.session.roomCode = room.code;
+            ws.session.roomCode = roomCode;
             ws.session.playerId = player.id;
 
             ws.send(JSON.stringify({
@@ -188,8 +227,10 @@ class LobbyServer {
         }
 
         if (msg.type === "kickPlayer") {
-            if (!ws.session || !ws.session.roomCode) {
-                ws.send(JSON.stringify({ type: "error", message: "No estas en una sala" }));
+            const { playerId } = msg;
+
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
                 return;
             }
 
@@ -200,21 +241,18 @@ class LobbyServer {
                 return;
             }
 
-            const kickResult = room.kickPlayer(msg.playerId, ws.session.playerId);
+            const kickResult = room.kickPlayer(playerId, ws.session.userId);
 
             if (!kickResult.success) {
                 ws.send(JSON.stringify({ type: "error", message: kickResult.message }));
                 return;
             }
 
-            const kickedPlayer = room.players.find((p) => p.id === msg.playerId);
+            const kickedSocket = this.playerSessions.get(playerId);
 
-            if (kickedPlayer && kickedPlayer.ws) {
-                kickedPlayer.ws.send(JSON.stringify({
-                    type: "kicked",
-                    message: "Fuiste expulsado de la sala"
-                }));
-                this.removePlayerFromRoom(kickedPlayer);
+            if (kickedSocket) {
+                kickedSocket.send(JSON.stringify({ type: "kicked", message: "Has sido expulsado de la sala" }));
+                this.removePlayerFromRoom(kickedSocket);
             }
 
             this.sendPlayerList(room);
@@ -223,23 +261,20 @@ class LobbyServer {
 
         if (msg.type === "adminGetUsers") {
             const users = this.userManager.getAllUsers();
-            ws.send(JSON.stringify({
-                type: "adminUsersList",
-                users,
-                totalUsers: users.length
-            }));
+            ws.send(JSON.stringify({ type: "adminUsersList", users }));
             return;
         }
     }
 
     handleClose(ws) {
+        console.log("[SERVER] Conexion cerrada");
         if (ws.session && ws.session.userId) {
             this.playerSessions.delete(ws.session.userId);
         }
-
         this.removePlayerFromRoom(ws);
     }
 }
 
-const lobbyServer = new LobbyServer(wss);
-lobbyServer.start();
+const lobby = new LobbyServer(wss);
+lobby.start();
+console.log("[SERVER] Servidor en puerto 3000");
