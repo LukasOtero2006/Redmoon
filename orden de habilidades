@@ -1,0 +1,36 @@
+Orden en el que actaun los diferentes roles:
+:cada rol se despierta, se le activa la opcion de usar su habilidad, lo utiliza( o no) y duerme
+
+primera noche:
+
+-pueblo duerme
+
+-cupido enamora a dos jugadores cualesquiera, incluyendose a si mismo
+
+-niño salvaje elige un modelo a seguir
+
+-habilidades habituales
+
+-todos duermen
+
+-pueblo despierta
+
+resto de noches:
+
+-pueblo duerme
+
+(habilidades habituales){
+-si no ha usado su habilidad despierta lobo alfa y puede elegir a alguien a quein convierte en lobo o no elegir a nadie esa noche
+-guardia elige a una persona para que no pueda morir esa noche, el incluido
+-despiertan todos los lobos menos el lobo solitario y entre todos eligen a una persona a la que matar, todos deben elegir a alguien y el que mas votos tenga muere,
+si hay empate se hace al azar entre los empatados. No pueden asesinar a un lobo, ya sea lobo comun, lobo alfa ni lobo solitario.
+-se despierta la bruja si le queda cualquiera de las dos pociones, se le dice cual ha sido la victima de los lobos y puede usar la pocion de salvacion para revivirle o puede elegir una victima,
+solo puede hacer una accion por turnno y solo tiene un uso por habilidad por partida
+-(en las noches impares) se despierta el lobo solitario y elige una victima, puede ser cualquiera, lobos comunes incluidos, menos el lobo alfa y el lobo solitario
+-se levanta el doctor si le quedan pociones, solo tiene 3 por partida, se le dicen los muertos y decide si salvar a alguien, solo uno por ronda, o no, no puede salvarse a si mismo
+-se despierta la vidente si no ha usado su habilidad la noche anterior, no puede usarla dos noches seguidas, y elige si quiere conocer el rol de algun jugador.
+}
+
+-todos duermen
+
+-el pueblo se despierta, se dicen los muertos y se procede a votar
