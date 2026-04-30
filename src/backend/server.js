@@ -996,7 +996,12 @@ class LobbyServer {
             }
 
             if (ws.readyState === 1) {
-                ws.send(JSON.stringify({ type: "info", message: `Has convertido a ${result.target.nickname || result.target.username} en lobo.` }));
+                ws.send(JSON.stringify({
+                    type: "info",
+                    message: result.skipped
+                        ? "Has decidido no convertir a nadie esta noche."
+                        : `Has convertido a ${result.target.nickname || result.target.username} en lobo.`
+                }));
             }
 
             const progress = room.registerPhaseAction("night-alpha", ws.session.userId);
