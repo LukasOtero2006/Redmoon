@@ -23,7 +23,7 @@ class LobbyServer {
     }
 
     sendToWolves(room, message) {
-        room.getAliveWolves().forEach((wolf) => {
+        room.getAliveWolfPack().forEach((wolf) => {
             if (wolf.ws.readyState === 1) {
                 wolf.ws.send(JSON.stringify(message));
             }
@@ -47,6 +47,13 @@ class LobbyServer {
         const spectatorMap = room.getSpectatorRoleMap();
 
         room.players.forEach((player) => {
+            if (player.ws.readyState === 1) {
+                player.ws.send(JSON.stringify({
+                    type: "privateRoleState",
+                    state: room.getPrivateRoleState(player.id)
+                }));
+            }
+
             if (player.isAlive === false && player.ws.readyState === 1) {
                 player.ws.send(JSON.stringify({
                     type: "spectatorRoleMap",
@@ -135,7 +142,15 @@ class LobbyServer {
         this.sendRoomState(room);
         this.broadcast(room, {
             type: "phaseInfo",
+            message: "El pueblo se duerme. Comienza la noche."
+        });
+        this.broadcast(room, {
+            type: "phaseInfo",
             message: `Noche ${room.nightNumber}: comienza la ronda de habilidades.`
+        });
+        this.broadcast(room, {
+            type: "nightOrder",
+            order: room.nightQueue
         });
         this.broadcast(room, {
             type: "firstNightOrder",
@@ -160,22 +175,6 @@ class LobbyServer {
             return;
         }
 
-        // Auto-advance if a role does not act to avoid hard-locking the match.
-        this.setRoomTimer(room.code, () => {
-            const currentRoom = this.roomManager.getRoom(room.code);
-            if (!currentRoom || !currentRoom.gameStarted) {
-                return;
-            }
-
-            if (currentRoom.getCurrentNightPhase() === phase) {
-                this.broadcast(currentRoom, {
-                    type: "info",
-                    message: `Tiempo agotado para ${phase}. Se avanza a la siguiente fase.`
-                });
-                this.advanceNightPhase(currentRoom.code);
-            }
-        }, 25000);
-
         if (phase === "night-first-cupid") {
             this.broadcast(room, { type: "phaseInfo", message: "Despierta Cupido" });
             return;
@@ -183,6 +182,19 @@ class LobbyServer {
 
         if (phase === "night-first-wildchild") {
             this.broadcast(room, { type: "phaseInfo", message: "Despierta Niño Salvaje" });
+            return;
+        }
+
+        if (phase === "night-alpha") {
+            this.broadcast(room, { type: "phaseInfo", message: "Despierta el Lobo Alfa" });
+            room.getPlayersWithRole("Lobo Alfa").forEach((alpha) => {
+                if (alpha.ws.readyState === 1) {
+                    alpha.ws.send(JSON.stringify({
+                        type: "wolfAlphaTurn",
+                        players: room.getDayVotingEligiblePlayers().filter((player) => !room.isWolfRole(room.playerRoles[player.id]))
+                    }));
+                }
+            });
             return;
         }
 
@@ -201,7 +213,13 @@ class LobbyServer {
             this.broadcast(room, { type: "phaseInfo", message: "Despierta el Doctor" });
             const doctor = room.getAliveDoctor();
             if (doctor && doctor.ws.readyState === 1) {
-                doctor.ws.send(JSON.stringify({ type: "doctorTurn", victimId: room.pendingVictimId }));
+                const effectiveVictimId = room.getEffectiveNightVictimId();
+                doctor.ws.send(JSON.stringify({
+                    type: "doctorTurn",
+                    victimId: effectiveVictimId,
+                    canSave: Boolean(effectiveVictimId) && room.roleState.doctorHealsLeft > 0,
+                    noVictim: !effectiveVictimId
+                }));
             }
             return;
         }
@@ -216,6 +234,20 @@ class LobbyServer {
                         canHeal: !room.roleState.witchHealUsed,
                         canPoison: !room.roleState.witchPoisonUsed,
                         players: room.getDayVotingEligiblePlayers()
+                    }));
+                }
+            });
+            return;
+        }
+
+        if (phase === "night-lonewolf") {
+            this.broadcast(room, { type: "phaseInfo", message: "Despierta el Lobo Solitario" });
+            room.getPlayersWithRole("Lobo Solitario").forEach((loneWolf) => {
+                if (loneWolf.ws.readyState === 1) {
+                    loneWolf.ws.send(JSON.stringify({
+                        type: "wolfTurn",
+                        players: room.getDayVotingEligiblePlayers().filter((player) => room.playerRoles[player.id] !== "Lobo Alfa" && room.playerRoles[player.id] !== "Lobo Solitario"),
+                        loneWolf: true
                     }));
                 }
             });
@@ -257,35 +289,64 @@ class LobbyServer {
             return;
         }
 
-        const { diedPlayer, diedPlayers } = room.resolveNightOutcome();
+        const { diedPlayers, transformedPlayers } = room.resolveNightOutcome();
+
+        if (room.hasPendingHunterShots()) {
+            room.roleState.pendingDayStartAfterHunter = true;
+            room.roleState.pendingDaySummaryVictims = (diedPlayers || []).map((player) => ({
+                id: player.id,
+                username: player.name,
+                nickname: player.nickname || player.name,
+                role: room.playerRoles[player.id] || "Aldeano",
+                deathCause: room.deathCauseByPlayerId[player.id] || "asesinado"
+            }));
+            this.sendPlayerList(room);
+            this.sendRoomState(room);
+            this.notifyRoleTransformations(room, transformedPlayers || []);
+            this.broadcast(room, {
+                type: "phaseInfo",
+                message: "El Cazador caido en la noche debe actuar antes de que amanezca."
+            });
+            this.sendPendingHunterTurns(room);
+            return;
+        }
+
+        this.startDayAfterNightDeaths(room, (diedPlayers || []).map((player) => ({
+            id: player.id,
+            username: player.name,
+            nickname: player.nickname || player.name,
+            role: room.playerRoles[player.id] || "Aldeano",
+            deathCause: room.deathCauseByPlayerId[player.id] || "asesinado"
+        })));
+        this.notifyRoleTransformations(room, transformedPlayers || []);
+    }
+
+    startDayAfterNightDeaths(room, victims) {
+        const victimList = Array.isArray(victims) ? victims : [];
+        const firstVictim = victimList[0] || null;
+
         room.setDayPhase();
 
         this.sendPlayerList(room);
         this.sendRoomState(room);
+        this.broadcast(room, {
+            type: "phaseInfo",
+            message: "El pueblo despierta. Se anuncian los muertos y comienza la votación."
+        });
         this.broadcast(room, {
             type: "wakeOrder",
             order: room.getWakeOrder()
         });
         this.broadcast(room, {
             type: "daySummary",
-            victims: (diedPlayers || []).map((player) => ({
-                id: player.id,
-                username: player.name,
-                nickname: player.nickname || player.name
-            })),
-            victim: diedPlayer
-                ? {
-                    id: diedPlayer.id,
-                    username: diedPlayer.name,
-                    nickname: diedPlayer.nickname || diedPlayer.name
-                }
-                : null
+            victims: victimList,
+            victim: firstVictim
         });
 
-        if (diedPlayers && diedPlayers.length > 0) {
+        if (victimList.length > 0) {
             this.broadcast(room, {
                 type: "info",
-                message: `Amanece. Han muerto: ${diedPlayers.map((p) => p.nickname || p.name).join(", ")}.`
+                message: `Amanece. Han muerto: ${victimList.map((p) => `${p.nickname || p.username} (${p.deathCause || "asesinado"})`).join(", ")}.`
             });
         } else {
             this.broadcast(room, {
@@ -296,13 +357,66 @@ class LobbyServer {
 
         const victoryAfterNight = room.checkVictory();
         if (victoryAfterNight.finished) {
+            room.finishGameToLobby(victoryAfterNight.reason);
+            this.sendPlayerList(room);
+            this.sendRoomState(room);
             this.broadcast(room, { type: "gameFinished", message: victoryAfterNight.reason });
             return;
         }
 
+        room.roleState.dayVoteStarted = true;
         this.broadcast(room, {
             type: "voteStart",
             players: room.getDayVotingEligiblePlayers()
+        });
+    }
+
+    sendPendingHunterTurns(room) {
+        const pendingHunterIds = room.getPendingHunterIds();
+
+        if (!pendingHunterIds.length) {
+            return false;
+        }
+
+        this.broadcast(room, {
+            type: "phaseInfo",
+            message: "El Cazador caido debe disparar antes de continuar."
+        });
+
+        pendingHunterIds.forEach((hunterId) => {
+            const hunter = room.getPlayerById(hunterId);
+            if (!hunter || hunter.ws.readyState !== 1) {
+                return;
+            }
+
+            hunter.ws.send(JSON.stringify({
+                type: "hunterTurn",
+                players: room.getHunterShotCandidates(hunterId)
+            }));
+        });
+
+        return true;
+    }
+
+    notifyRoleTransformations(room, transformedPlayers) {
+        if (!Array.isArray(transformedPlayers) || transformedPlayers.length === 0) {
+            return;
+        }
+
+        transformedPlayers.forEach((change) => {
+            const player = room.getPlayerById(change.playerId);
+            if (!player || player.ws.readyState !== 1) {
+                return;
+            }
+
+            player.ws.send(JSON.stringify({
+                type: "roleChanged",
+                fromRole: change.fromRole,
+                toRole: change.toRole,
+                modelPlayerId: change.modelPlayerId,
+                modelRole: change.modelRole,
+                message: `Tu modelo ha muerto. Ahora eres ${change.toRole}.`
+            }));
         });
     }
 
@@ -319,7 +433,8 @@ class LobbyServer {
             this.sendRoomState(room);
             this.broadcast(room, {
                 type: "voteResult",
-                expelled: result.expelled
+                expelled: result.expelled,
+                additionalDeaths: result.additionalDeaths || []
             });
 
             this.broadcast(room, {
@@ -327,9 +442,27 @@ class LobbyServer {
                 message: `${result.expelled.nickname} fue expulsado y era ${result.expelled.role}.`
             });
 
+            if (Array.isArray(result.additionalDeaths) && result.additionalDeaths.length > 0) {
+                this.broadcast(room, {
+                    type: "info",
+                    message: `Muertes adicionales tras la votacion: ${result.additionalDeaths.map((p) => `${p.nickname} (${p.deathCause || "asesinado"})`).join(", ")}.`
+                });
+            }
+
+            this.notifyRoleTransformations(room, result.transformedPlayers || []);
+
+            if (room.hasPendingHunterShots()) {
+                room.roleState.pendingNightAfterHunter = true;
+                this.sendPendingHunterTurns(room);
+                return;
+            }
+
             const victoryAfterVote = room.checkVictory();
 
             if (victoryAfterVote.finished) {
+                room.finishGameToLobby(victoryAfterVote.reason);
+                this.sendPlayerList(room);
+                this.sendRoomState(room);
                 this.broadcast(room, { type: "gameFinished", message: victoryAfterVote.reason });
                 this.clearRoomTimer(roomCode);
                 return;
@@ -339,6 +472,53 @@ class LobbyServer {
         }
 
         this.startNightPhase(roomCode);
+    }
+
+    continueAfterHunterShots(room) {
+        if (!room || !room.gameStarted) {
+            return;
+        }
+
+        if (room.hasPendingHunterShots()) {
+            this.sendPendingHunterTurns(room);
+            return;
+        }
+
+        this.sendPlayerList(room);
+        this.sendRoomState(room);
+
+        const victory = room.checkVictory();
+        if (victory.finished) {
+            room.finishGameToLobby(victory.reason);
+            this.sendPlayerList(room);
+            this.sendRoomState(room);
+            this.broadcast(room, { type: "gameFinished", message: victory.reason });
+            return;
+        }
+
+        if (room.roleState.pendingDayStartAfterHunter) {
+            room.roleState.pendingDayStartAfterHunter = false;
+            const victims = Array.isArray(room.roleState.pendingDaySummaryVictims)
+                ? room.roleState.pendingDaySummaryVictims
+                : [];
+            room.roleState.pendingDaySummaryVictims = [];
+            this.startDayAfterNightDeaths(room, victims);
+            return;
+        }
+
+        if (room.roleState.pendingNightAfterHunter) {
+            room.roleState.pendingNightAfterHunter = false;
+            this.startNightPhase(room.code);
+            return;
+        }
+
+        if (!room.roleState.dayVoteStarted) {
+            room.roleState.dayVoteStarted = true;
+            this.broadcast(room, {
+                type: "voteStart",
+                players: room.getDayVotingEligiblePlayers()
+            });
+        }
     }
 
     startGameFlow(room) {
@@ -591,6 +771,31 @@ class LobbyServer {
             }
 
             this.sendPlayerList(room);
+            this.sendRoomState(room);
+            return;
+        }
+
+        if (msg.type === "setAvatar") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            const room = this.roomFromSession(ws);
+
+            if (!room) {
+                ws.send(JSON.stringify({ type: "error", message: "No estas en una sala" }));
+                return;
+            }
+
+            const result = room.setPlayerAvatar(ws.session.userId, msg.avatarId);
+
+            if (!result.success) {
+                ws.send(JSON.stringify({ type: "error", message: result.message }));
+                return;
+            }
+
+            this.sendPlayerList(room);
             return;
         }
 
@@ -745,7 +950,56 @@ class LobbyServer {
                 type: "info",
                 message: `${ws.session.username} ha elegido una victima.`
             });
-            const progress = room.registerPhaseAction("night-wolves", ws.session.userId);
+
+            const actionPhase = room.gamePhase === "night-lonewolf" ? "night-lonewolf" : "night-wolves";
+            const progress = room.registerPhaseAction(actionPhase, ws.session.userId);
+            if (progress.success && progress.completed) {
+                if (actionPhase === "night-wolves") {
+                    const voteResult = room.finalizeWolfPackVictimVote();
+                    if (!voteResult.success) {
+                        ws.send(JSON.stringify({ type: "error", message: voteResult.message }));
+                        return;
+                    }
+
+                    this.sendToWolves(room, {
+                        type: "info",
+                        message: voteResult.tied
+                            ? `Empate entre objetivos. Se elige al azar a ${voteResult.target.nickname || voteResult.target.name}.`
+                            : `La manada ataca a ${voteResult.target.nickname || voteResult.target.name}.`
+                    });
+                }
+
+                this.advanceNightPhase(room.code);
+            }
+            return;
+        }
+
+        if (msg.type === "wolfAlphaConvert") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            const room = this.roomFromSession(ws);
+
+            if (!room) {
+                ws.send(JSON.stringify({ type: "error", message: "No estas en una sala" }));
+                return;
+            }
+
+            const targetPlayerId = String(msg.targetPlayerId || "").trim();
+            const result = room.wolfAlphaConvert(ws.session.userId, targetPlayerId);
+
+            if (!result.success) {
+                ws.send(JSON.stringify({ type: "error", message: result.message }));
+                return;
+            }
+
+            if (ws.readyState === 1) {
+                ws.send(JSON.stringify({ type: "info", message: `Has convertido a ${result.target.nickname || result.target.username} en lobo.` }));
+            }
+
+            const progress = room.registerPhaseAction("night-alpha", ws.session.userId);
             if (progress.success && progress.completed) {
                 this.advanceNightPhase(room.code);
             }
@@ -831,8 +1085,66 @@ class LobbyServer {
             ws.send(JSON.stringify({ type: "seerResult", target: result.target }));
             const progress = room.registerPhaseAction("night-seer", ws.session.userId);
             if (progress.success && progress.completed) {
-                this.advanceNightPhase(room.code);
+                this.broadcast(room, {
+                    type: "phaseInfo",
+                    message: "La Vidente ha recibido su vision. Amanece en 5 segundos..."
+                });
+                this.setRoomTimer(room.code, () => {
+                    const activeRoom = this.roomManager.getRoom(room.code);
+                    if (!activeRoom || !activeRoom.gameStarted || activeRoom.gamePhase !== "night-seer") {
+                        return;
+                    }
+                    this.advanceNightPhase(room.code);
+                }, 5000);
             }
+            return;
+        }
+
+        if (msg.type === "hunterShoot") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            const room = this.roomFromSession(ws);
+
+            if (!room) {
+                ws.send(JSON.stringify({ type: "error", message: "No estas en una sala" }));
+                return;
+            }
+
+            const result = room.hunterShoot(ws.session.userId, String(msg.targetPlayerId || "").trim());
+
+            if (!result.success) {
+                ws.send(JSON.stringify({ type: "error", message: result.message }));
+                return;
+            }
+
+            this.broadcast(room, {
+                type: "hunterShotResult",
+                shooterId: ws.session.userId,
+                noKill: Boolean(result.noKill),
+                target: result.target
+                    ? {
+                        id: result.target.id,
+                        username: result.target.name,
+                        nickname: result.target.nickname || result.target.name,
+                        role: room.playerRoles[result.target.id] || "Aldeano",
+                        deathCause: room.deathCauseByPlayerId[result.target.id] || "disparo del cazador"
+                    }
+                    : null,
+                victims: (result.diedPlayers || []).map((p) => ({
+                    id: p.id,
+                    username: p.name,
+                    nickname: p.nickname || p.name,
+                    role: room.playerRoles[p.id] || "Aldeano",
+                    deathCause: room.deathCauseByPlayerId[p.id] || "asesinado"
+                }))
+            });
+
+            this.notifyRoleTransformations(room, result.transformedPlayers || []);
+
+            this.continueAfterHunterShots(room);
             return;
         }
 
