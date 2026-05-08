@@ -12,6 +12,7 @@ class LobbyServer {
         this.userManager = new UserManager();
         this.playerSessions = new Map();
         this.roomTimers = new Map();
+        this.disconnectTimers = new Map();
     }
 
     broadcast(room, message) {
@@ -289,16 +290,21 @@ class LobbyServer {
             return;
         }
 
-        const { diedPlayers, transformedPlayers } = room.resolveNightOutcome();
+        const resolved = room.resolveNightOutcome();
+        const diedPlayers = resolved.diedPlayers || [];
+        const transformedPlayers = resolved.transformedPlayers || [];
+        const lastNightDeaths = resolved.lastNightDeaths || [];
 
         if (room.hasPendingHunterShots()) {
             room.roleState.pendingDayStartAfterHunter = true;
-            room.roleState.pendingDaySummaryVictims = (diedPlayers || []).map((player) => ({
-                id: player.id,
-                username: player.name,
-                nickname: player.nickname || player.name,
-                role: room.playerRoles[player.id] || "Aldeano",
-                deathCause: room.deathCauseByPlayerId[player.id] || "asesinado"
+            // preserve ordered night death summary
+            room.roleState.pendingDaySummaryVictims = (lastNightDeaths || []).map((d) => ({
+                id: d.id,
+                username: d.username,
+                nickname: d.nickname,
+                role: d.role,
+                deathCause: d.deathCause,
+                time: d.time
             }));
             this.sendPlayerList(room);
             this.sendRoomState(room);
@@ -310,13 +316,13 @@ class LobbyServer {
             this.sendPendingHunterTurns(room);
             return;
         }
-
-        this.startDayAfterNightDeaths(room, (diedPlayers || []).map((player) => ({
-            id: player.id,
-            username: player.name,
-            nickname: player.nickname || player.name,
-            role: room.playerRoles[player.id] || "Aldeano",
-            deathCause: room.deathCauseByPlayerId[player.id] || "asesinado"
+        this.startDayAfterNightDeaths(room, (lastNightDeaths || []).map((d) => ({
+            id: d.id,
+            username: d.username,
+            nickname: d.nickname,
+            role: d.role,
+            deathCause: d.deathCause,
+            time: d.time
         })));
         this.notifyRoleTransformations(room, transformedPlayers || []);
     }
@@ -357,10 +363,18 @@ class LobbyServer {
 
         const victoryAfterNight = room.checkVictory();
         if (victoryAfterNight.finished) {
-            room.finishGameToLobby(victoryAfterNight.reason);
+            // Broadcast final summary and game finished, but delay reset so clients can see death details
             this.sendPlayerList(room);
             this.sendRoomState(room);
             this.broadcast(room, { type: "gameFinished", message: victoryAfterNight.reason });
+
+            // Delay actual finish to allow clients to render the final deaths and summary
+            setTimeout(() => {
+                room.finishGameToLobby(victoryAfterNight.reason);
+                this.sendPlayerList(room);
+                this.sendRoomState(room);
+            }, 3000);
+
             return;
         }
 
@@ -642,9 +656,36 @@ class LobbyServer {
             }
 
             ws.session = { userId: result.user.userId, username: result.user.username };
+
+            // if there was a pending disconnect timer for this user, cancel it
+            if (this.disconnectTimers.has(result.user.userId)) {
+                clearTimeout(this.disconnectTimers.get(result.user.userId));
+                this.disconnectTimers.delete(result.user.userId);
+            }
+
+            // attach session
             this.playerSessions.set(result.user.userId, ws);
 
+            // try to reattach to existing room/player if present
+            let reattachedRoom = null;
+            for (const code in this.roomManager.rooms) {
+                const room = this.roomManager.rooms[code];
+                const player = room.players.find((p) => p.id === result.user.userId);
+                if (player) {
+                    player.ws = ws;
+                    ws.session.roomCode = room.code;
+                    ws.session.playerId = player.id;
+                    reattachedRoom = room;
+                    break;
+                }
+            }
+
             ws.send(JSON.stringify({ type: "loginSuccess", user: result.user }));
+
+            if (reattachedRoom) {
+                this.sendPlayerList(reattachedRoom);
+                this.sendRoomState(reattachedRoom);
+            }
             return;
         }
 
@@ -1257,6 +1298,104 @@ class LobbyServer {
             return;
         }
 
+        if (msg.type === "searchUsers") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            const q = String(msg.query || "").trim();
+            const results = this.userManager.searchUsers(q || "");
+
+            // enrich results with relation flags and mutual friend count
+            const me = this.userManager.getUserById(ws.session.userId);
+            const myFriends = me ? new Set(Array.from(me.friends || [])) : new Set();
+
+            const enriched = results.map((r) => {
+                const isMe = r.userId === ws.session.userId;
+                const isFriend = myFriends.has(r.userId);
+                const target = this.userManager.getUserById(r.userId);
+                const targetFriends = target ? new Set(Array.from(target.friends || [])) : new Set();
+                const mutual = Array.from(targetFriends).filter((id) => myFriends.has(id)).length;
+
+                return {
+                    userId: r.userId,
+                    username: r.username,
+                    profileImageUrl: r.profileImageUrl,
+                    gamesPlayed: r.gamesPlayed,
+                    createdAt: r.createdAt,
+                    isMe,
+                    isFriend,
+                    mutualFriends: mutual
+                };
+            });
+
+            ws.send(JSON.stringify({ type: "searchResults", results: enriched }));
+            return;
+        }
+
+        if (msg.type === "getUserProfile") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            const targetUserId = String(msg.userId || "").trim();
+            const target = this.userManager.getUserById(targetUserId);
+
+            if (!target) {
+                ws.send(JSON.stringify({ type: "error", message: "Usuario no encontrado" }));
+                return;
+            }
+
+            // compute mutual friends
+            const me = this.userManager.getUserById(ws.session.userId);
+            const myFriends = me ? new Set(Array.from(me.friends || [])) : new Set();
+            const targetFriends = new Set(Array.from(target.friends || []));
+            const mutual = Array.from(targetFriends).filter((id) => myFriends.has(id)).map((id) => {
+                const u = this.userManager.getUserById(id);
+                return u ? { userId: u.userId, username: u.username } : null;
+            }).filter(Boolean);
+
+            ws.send(JSON.stringify({ type: "profileData", user: this.userManager.toClientUser(target), mutualFriends: mutual }));
+            return;
+        }
+
+        if (msg.type === "uploadProfileImage") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            const dataUrl = String(msg.dataUrl || "").trim();
+            if (!dataUrl) {
+                ws.send(JSON.stringify({ type: "error", message: "Imagen invalida" }));
+                return;
+            }
+
+            const result = this.userManager.setProfileImage(ws.session.userId, dataUrl);
+
+            if (!result.success) {
+                ws.send(JSON.stringify({ type: "error", message: result.message }));
+                return;
+            }
+
+            // notify user and their online friends
+            this.sendUserProfile(ws.session.userId);
+            const user = this.userManager.getUserById(ws.session.userId);
+            if (user) {
+                for (const friendId of user.friends) {
+                    const sock = this.playerSessions.get(friendId);
+                    if (sock && sock.readyState === 1) {
+                        sock.send(JSON.stringify({ type: "friendProfileUpdated", userId: user.userId }));
+                    }
+                }
+            }
+
+            ws.send(JSON.stringify({ type: "info", message: "Foto de perfil actualizada" }));
+            return;
+        }
+
         if (msg.type === "updateRoomSettings") {
             if (!ws.session) {
                 ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
@@ -1388,9 +1527,27 @@ class LobbyServer {
 
     handleClose(ws) {
         if (ws.session && ws.session.userId) {
-            this.playerSessions.delete(ws.session.userId);
+            const userId = ws.session.userId;
+
+            // start a short grace period to allow reconnects
+            if (this.disconnectTimers.has(userId)) {
+                clearTimeout(this.disconnectTimers.get(userId));
+            }
+
+            const t = setTimeout(() => {
+                // if still not reconnected, remove session and from room
+                const mapped = this.playerSessions.get(userId);
+                if (!mapped) {
+                    this.removePlayerFromRoom(ws);
+                }
+                this.disconnectTimers.delete(userId);
+            }, 60 * 1000);
+
+            this.disconnectTimers.set(userId, t);
+            this.playerSessions.delete(userId);
+        } else {
+            this.removePlayerFromRoom(ws);
         }
-        this.removePlayerFromRoom(ws);
     }
 }
 
