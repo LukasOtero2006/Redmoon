@@ -2,6 +2,7 @@ import { WebSocketServer } from "ws";
 import { Player } from "./classes/Player.js";
 import { RoomManager } from "./classes/RoomManager.js";
 import { UserManager } from "./classes/UserManager.js";
+import { GameHistory } from "./classes/GameHistory.js";
 
 const wss = new WebSocketServer({ port: 3000 });
 
@@ -37,6 +38,18 @@ class LobbyServer {
             roomCode: room.code,
             players: room.getPlayerList()
         });
+    }
+
+    sendEventLog(room, targetWs = null) {
+        const message = {
+            type: "eventLog",
+            events: room.getEventLog()
+        };
+        if (targetWs) {
+            targetWs.send(JSON.stringify(message));
+        } else {
+            this.broadcast(room, message);
+        }
     }
 
     sendRoomState(room) {
@@ -132,6 +145,68 @@ class LobbyServer {
         }
     }
 
+    normalizeWinnerForHistory(winner) {
+        if (winner === "aldeanos") {
+            return "village";
+        }
+        if (winner === "lobos") {
+            return "wolves";
+        }
+        return winner || "manual_end";
+    }
+
+    buildHistorySnapshot(room, winner = "") {
+        return {
+            roomCode: room.code,
+            nightsPlayed: Number(room.nightNumber || 0),
+            winner: this.normalizeWinnerForHistory(winner),
+            players: room.players.map((p) => ({
+                id: p.id,
+                username: p.name,
+                role: room.playerRoles[p.id] || "Desconocido",
+                alive: p.isAlive !== false
+            }))
+        };
+    }
+
+    persistRoomHistory(room, winner = "") {
+        if (!room || !Array.isArray(room.players) || room.players.length === 0) {
+            return;
+        }
+
+        const snapshot = this.buildHistorySnapshot(room, winner);
+        const startedAt = room.matchStartedAt || Date.now();
+        const endedAt = Date.now();
+
+        room.players.forEach((player) => {
+            const history = new GameHistory(
+                `game_${room.code}_${endedAt}_${player.id}`,
+                room.code,
+                player.name,
+                room.playerRoles[player.id] || "Desconocido",
+                snapshot.winner === "manual_end"
+                    ? (player.isAlive !== false ? "alive" : "dead")
+                    : (snapshot.winner === "village"
+                        ? (room.isWolfRole(room.playerRoles[player.id]) ? "lose" : "win")
+                        : (room.isWolfRole(room.playerRoles[player.id]) ? "win" : "lose")),
+                startedAt,
+                endedAt,
+                snapshot
+            );
+
+            this.userManager.addGameHistory(player.name, history);
+        });
+    }
+
+    finishGameAndPersistHistory(room, winner, message) {
+        if (!room) {
+            return;
+        }
+
+        this.persistRoomHistory(room, winner);
+        room.finishGameToLobby(message);
+    }
+
     startNightPhase(roomCode) {
         const room = this.roomManager.getRoom(roomCode);
 
@@ -219,7 +294,8 @@ class LobbyServer {
                     type: "doctorTurn",
                     victimId: effectiveVictimId,
                     canSave: Boolean(effectiveVictimId) && room.roleState.doctorHealsLeft > 0,
-                    noVictim: !effectiveVictimId
+                    noVictim: !effectiveVictimId,
+                    doctorHealsLeft: room.roleState.doctorHealsLeft
                 }));
             }
             return;
@@ -370,7 +446,7 @@ class LobbyServer {
 
             // Delay actual finish to allow clients to render the final deaths and summary
             setTimeout(() => {
-                room.finishGameToLobby(victoryAfterNight.reason);
+                this.finishGameAndPersistHistory(room, victoryAfterNight.winner, victoryAfterNight.reason);
                 this.sendPlayerList(room);
                 this.sendRoomState(room);
             }, 3000);
@@ -474,7 +550,7 @@ class LobbyServer {
             const victoryAfterVote = room.checkVictory();
 
             if (victoryAfterVote.finished) {
-                room.finishGameToLobby(victoryAfterVote.reason);
+                this.finishGameAndPersistHistory(room, victoryAfterVote.winner, victoryAfterVote.reason);
                 this.sendPlayerList(room);
                 this.sendRoomState(room);
                 this.broadcast(room, { type: "gameFinished", message: victoryAfterVote.reason });
@@ -503,7 +579,7 @@ class LobbyServer {
 
         const victory = room.checkVictory();
         if (victory.finished) {
-            room.finishGameToLobby(victory.reason);
+            this.finishGameAndPersistHistory(room, victory.winner, victory.reason);
             this.sendPlayerList(room);
             this.sendRoomState(room);
             this.broadcast(room, { type: "gameFinished", message: victory.reason });
@@ -787,6 +863,7 @@ class LobbyServer {
 
             this.sendPlayerList(room);
             this.sendRoomState(room);
+            this.sendEventLog(room, ws);
             ws.send(JSON.stringify({ type: "roomChatHistory", messages: room.chatMessages }));
             return;
         }
@@ -1396,6 +1473,22 @@ class LobbyServer {
             return;
         }
 
+        if (msg.type === "getGameHistory") {
+            if (!ws.session) {
+                ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
+                return;
+            }
+
+            const user = this.userManager.getUserById(ws.session.userId);
+            if (!user) {
+                ws.send(JSON.stringify({ type: "error", message: "Usuario no encontrado" }));
+                return;
+            }
+
+            ws.send(JSON.stringify({ type: "gameHistory", games: user.gamesPlayed || [] }));
+            return;
+        }
+
         if (msg.type === "updateRoomSettings") {
             if (!ws.session) {
                 ws.send(JSON.stringify({ type: "error", message: "Debes iniciar sesion" }));
@@ -1441,6 +1534,7 @@ class LobbyServer {
             }
 
             this.sendPlayerList(room);
+            this.sendEventLog(room);
             this.broadcast(room, { type: "roomChatHistory", messages: [] });
 
             room.players.forEach((player) => {
@@ -1470,17 +1564,24 @@ class LobbyServer {
                 return;
             }
 
-            const result = room.endOrCancelGame(ws.session.userId, false);
-
-            if (!result.success) {
-                ws.send(JSON.stringify({ type: "error", message: result.message }));
+            if (!room.host || room.host.id !== ws.session.userId) {
+                ws.send(JSON.stringify({ type: "error", message: "Solo el host puede finalizar la partida" }));
                 return;
             }
+
+            const message = "Partida terminada por el host";
+            const hadProgress = room.gameStarted && Number(room.nightNumber || 0) > 0;
+
+            if (hadProgress) {
+                this.persistRoomHistory(room, "manual_end");
+            }
+
+            room.finishGameToLobby(message);
 
             this.clearRoomTimer(room.code);
             this.sendPlayerList(room);
             this.sendRoomState(room);
-            this.broadcast(room, { type: "gameFinished", message: result.message });
+            this.broadcast(room, { type: "gameFinished", message });
             return;
         }
 
