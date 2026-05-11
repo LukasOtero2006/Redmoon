@@ -426,9 +426,15 @@ class LobbyServer {
         });
 
         if (victimList.length > 0) {
+            const victimText = victimList.map((p) => {
+                const playerName = p.nickname || p.username;
+                const roleName = p.role || "Aldeano";
+                const cause = p.deathCause || "asesinado";
+                return `${playerName} (${roleName}, ${cause})`;
+            }).join(", ");
             this.broadcast(room, {
                 type: "info",
-                message: `Amanece. Han muerto: ${victimList.map((p) => `${p.nickname || p.username} (${p.deathCause || "asesinado"})`).join(", ")}.`
+                message: `Amanece. Han muerto: ${victimText}.`
             });
         } else {
             this.broadcast(room, {
@@ -647,6 +653,7 @@ class LobbyServer {
         } else {
             this.sendPlayerList(room);
             this.sendRoomState(room);
+            this.sendEventLog(room);
         }
 
         delete ws.session.roomCode;
@@ -818,6 +825,7 @@ class LobbyServer {
 
             this.sendPlayerList(room);
             this.sendRoomState(room);
+            this.sendEventLog(room);
             return;
         }
 
@@ -863,7 +871,7 @@ class LobbyServer {
 
             this.sendPlayerList(room);
             this.sendRoomState(room);
-            this.sendEventLog(room, ws);
+            this.sendEventLog(room);
             ws.send(JSON.stringify({ type: "roomChatHistory", messages: room.chatMessages }));
             return;
         }
