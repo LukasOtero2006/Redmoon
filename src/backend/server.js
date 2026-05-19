@@ -155,16 +155,69 @@ class LobbyServer {
         return winner || "manual_end";
     }
 
+    getWinningPlayers(room, winner) {
+        const normalizedWinner = this.normalizeWinnerForHistory(winner);
+
+        if (!room || !Array.isArray(room.players)) {
+            return [];
+        }
+
+        if (normalizedWinner === "village") {
+            return room.players.filter((player) => !room.isWolfRole(room.playerRoles[player.id]));
+        }
+
+        if (normalizedWinner === "wolves") {
+            return room.players.filter((player) => room.isWolfRole(room.playerRoles[player.id]));
+        }
+
+        return [];
+    }
+
+    buildHistorySummary(room, winner, snapshotPlayers) {
+        const normalizedWinner = this.normalizeWinnerForHistory(winner);
+        const winningLabel = normalizedWinner === "village"
+            ? "la aldea"
+            : (normalizedWinner === "wolves" ? "los lobos" : "nadie");
+        const deadPlayers = (snapshotPlayers || [])
+            .filter((player) => player.alive === false)
+            .map((player) => {
+                const role = player.role || "Desconocido";
+                const cause = room.deathCauseByPlayerId[player.id] || "eliminado";
+                return `${player.username} (${role}, ${cause})`;
+            });
+        const deathsText = deadPlayers.length
+            ? `Muertes: ${deadPlayers.join(", ")}.`
+            : "No hubo bajas.";
+
+        return `La partida terminó tras ${Number(room.nightNumber || 0)} noche(s). Ganaron ${winningLabel}. ${deathsText}`;
+    }
+
     buildHistorySnapshot(room, winner = "") {
+        const normalizedWinner = this.normalizeWinnerForHistory(winner);
+        const players = room.players.map((p) => ({
+            id: p.id,
+            username: p.name,
+            role: room.playerRoles[p.id] || "Desconocido",
+            alive: p.isAlive !== false
+        }));
+        const winners = this.getWinningPlayers(room, winner).map((player) => ({
+            id: player.id,
+            username: player.name,
+            role: room.playerRoles[player.id] || "Desconocido",
+            alive: player.isAlive !== false
+        }));
+
         return {
             roomCode: room.code,
             nightsPlayed: Number(room.nightNumber || 0),
-            winner: this.normalizeWinnerForHistory(winner),
-            players: room.players.map((p) => ({
-                id: p.id,
-                username: p.name,
-                role: room.playerRoles[p.id] || "Desconocido",
-                alive: p.isAlive !== false
+            winner: normalizedWinner,
+            winningTeam: normalizedWinner,
+            summary: this.buildHistorySummary(room, winner, players),
+            winners,
+            players,
+            storyEvents: room.getEventLog().slice(-20).map((entry) => ({
+                timestamp: entry.timestamp,
+                message: entry.message
             }))
         };
     }
@@ -281,7 +334,7 @@ class LobbyServer {
 
         if (phase === "night-wolves") {
             this.broadcast(room, { type: "phaseInfo", message: "Despiertan los lobos" });
-            this.sendToWolves(room, { type: "wolfChatHistory", messages: room.wolfChatMessages });
+            this.sendToWolves(room, { type: "wolfChatHistory", messages: room.chat ? room.chat.getWolfChat() : [] });
             return;
         }
 
@@ -872,7 +925,7 @@ class LobbyServer {
             this.sendPlayerList(room);
             this.sendRoomState(room);
             this.sendEventLog(room);
-            ws.send(JSON.stringify({ type: "roomChatHistory", messages: room.chatMessages }));
+            ws.send(JSON.stringify({ type: "roomChatHistory", messages: room.chat ? room.chat.getChat() : [] }));
             return;
         }
 
@@ -1342,17 +1395,15 @@ class LobbyServer {
             }
 
             const toUserId = String(msg.toUserId || "").trim();
-            const room = this.roomFromSession(ws);
-
-            if (!room) {
-                ws.send(JSON.stringify({ type: "error", message: "Solo puedes enviar solicitudes dentro de una sala o partida" }));
+            if (!toUserId) {
+                ws.send(JSON.stringify({ type: "error", message: "Usuario destino requerido" }));
                 return;
             }
 
-            const targetInRoom = room.players.some((p) => p.id === toUserId);
+            const targetUser = this.userManager.getUserById(toUserId);
 
-            if (!targetInRoom) {
-                ws.send(JSON.stringify({ type: "error", message: "Solo puedes solicitar amistad a jugadores de tu sala" }));
+            if (!targetUser) {
+                ws.send(JSON.stringify({ type: "error", message: "Usuario no encontrado" }));
                 return;
             }
 
@@ -1399,6 +1450,8 @@ class LobbyServer {
             const enriched = results.map((r) => {
                 const isMe = r.userId === ws.session.userId;
                 const isFriend = myFriends.has(r.userId);
+                const hasOutgoingRequest = me ? Array.from(me.outgoingFriendRequests || []).includes(r.userId) : false;
+                const hasIncomingRequest = me ? Array.from(me.incomingFriendRequests || []).includes(r.userId) : false;
                 const target = this.userManager.getUserById(r.userId);
                 const targetFriends = target ? new Set(Array.from(target.friends || [])) : new Set();
                 const mutual = Array.from(targetFriends).filter((id) => myFriends.has(id)).length;
@@ -1411,6 +1464,8 @@ class LobbyServer {
                     createdAt: r.createdAt,
                     isMe,
                     isFriend,
+                    hasOutgoingRequest,
+                    hasIncomingRequest,
                     mutualFriends: mutual
                 };
             });
