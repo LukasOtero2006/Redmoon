@@ -256,8 +256,111 @@ class LobbyServer {
             return;
         }
 
+        // persist history first
         this.persistRoomHistory(room, winner);
+
+        // compute and award points according to rules, then notify players
+        try {
+            this.computeAndAwardPoints(room, winner);
+        } catch (e) {
+            console.error("Error awarding points:", e && e.message);
+        }
+
         room.finishGameToLobby(message);
+    }
+
+    computeAndAwardPoints(room, winner) {
+        if (!room || !Array.isArray(room.players)) return;
+        const normalizedWinner = this.normalizeWinnerForHistory(winner);
+        const pointsByUser = new Map();
+
+        // helper to add points to a player object
+        const add = (player, amount) => {
+            if (!player || !player.name) return;
+            const cur = pointsByUser.get(player.name) || 0;
+            pointsByUser.set(player.name, cur + (Number(amount) || 0));
+        };
+
+        // base team scoring
+        room.players.forEach((player) => {
+            const role = room.playerRoles[player.id] || "Desconocido";
+            const isWolf = room.isWolfRole(role);
+            const alive = player.isAlive !== false;
+
+            if (normalizedWinner === "village") {
+                if (!isWolf) add(player, alive ? 2 : 1);
+            } else if (normalizedWinner === "wolves") {
+                if (isWolf) {
+                    if (alive) {
+                        // base 3 for alive wolves
+                        let pts = 3;
+                        // Lobo Alfa bonus: +1 if did NOT use its conversion power
+                        if (role === "Lobo Alfa") {
+                            const used = room.roleState && room.roleState.wolfAlphaUsedById && room.roleState.wolfAlphaUsedById[player.id];
+                            pts += used ? 0 : 1;
+                        }
+                        add(player, pts);
+                    } else {
+                        add(player, 1);
+                    }
+                }
+            }
+        });
+
+        // lone wolf special: if the only surviving wolf is a Lobo Solitario, award 5 points
+        try {
+            const aliveWolves = room.players.filter((p) => p.isAlive !== false && room.isWolfRole(room.playerRoles[p.id]));
+            if (aliveWolves.length === 1) {
+                const lone = aliveWolves[0];
+                if (room.playerRoles[lone.id] === "Lobo Solitario") {
+                    add(lone, 5); // per rules
+                }
+            }
+        } catch (e) {}
+
+        // hunter extra: hunters who used their shot and killed a wolf get +1 (or +2 if target was alpha)
+        try {
+            const hunterIds = Object.keys(room.roleState.hunterShotUsedById || {}).filter((id) => room.roleState.hunterShotUsedById[id]);
+            if (hunterIds.length) {
+                // find players with death cause 'disparo del cazador'
+                for (const [playerId, cause] of Object.entries(room.deathCauseByPlayerId || {})) {
+                    if (String(cause || "").toLowerCase().includes('disparo')) {
+                        const targetPlayer = room.getPlayerById(playerId);
+                        if (targetPlayer && room.isWolfRole(room.playerRoles[playerId])) {
+                            // award each hunter who used their shot one extra point
+                            hunterIds.forEach((hid) => {
+                                const hunter = room.getPlayerById(hid);
+                                if (hunter) {
+                                    let extra = 1;
+                                    if (room.playerRoles[playerId] === 'Lobo Alfa') extra = 2;
+                                    add(hunter, extra);
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        } catch (e) {}
+
+        // apply points to users and notify via websocket
+        pointsByUser.forEach((pts, username) => {
+            try {
+                this.userManager.addPoints(username, pts);
+            } catch (e) {}
+        });
+
+        // notify each player with their awarded points and total
+        room.players.forEach((player) => {
+            try {
+                const username = player.name;
+                const pts = pointsByUser.get(username) || 0;
+                const user = this.userManager.getUser(username);
+                const total = user ? (user.points || 0) : 0;
+                if (player.ws && player.ws.readyState === 1) {
+                    player.ws.send(JSON.stringify({ type: 'pointsAward', pointsGained: pts, totalPoints: total, message: `Has ganado ${pts} puntos` }));
+                }
+            } catch (e) {}
+        });
     }
 
     startNightPhase(roomCode) {
