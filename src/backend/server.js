@@ -207,6 +207,32 @@ class LobbyServer {
             alive: player.isAlive !== false
         }));
 
+        // attach points info from last compute, if available
+        const pointsByPlayer = room.lastGamePoints || {};
+        // augment players with points and visual helpers
+        const playersWithPoints = players.map((p) => {
+            const pts = Number(pointsByPlayer[p.username] || 0);
+            return {
+                ...p,
+                pointsAwarded: pts,
+                gained: pts > 0,
+                gainIntensity: Math.min(1, pts / 5)
+            };
+        });
+
+        // determine overall result color: yellow if any neutral got points, else green for village, red for wolves
+        let resultColor = "gray";
+        try {
+            const neutrals = Object.keys(room.playerRoles || {}).filter((pid) => {
+                const r = room.playerRoles[pid] || '';
+                return !room.isWolfRole(r) && r !== 'Aldeano' && r !== 'Lobo' && r !== 'Lobo Alfa' && r !== 'Lobo Solitario' && r !== '';
+            }).map((pid) => room.getPlayerById(pid)).filter(Boolean).map((p) => p.name);
+            const anyNeutralGained = neutrals.some((u) => Number(pointsByPlayer[u] || 0) > 0);
+            if (anyNeutralGained) resultColor = 'yellow';
+            else if (normalizedWinner === 'village') resultColor = 'green';
+            else if (normalizedWinner === 'wolves') resultColor = 'red';
+        } catch (e) {}
+
         return {
             roomCode: room.code,
             nightsPlayed: Number(room.nightNumber || 0),
@@ -214,7 +240,22 @@ class LobbyServer {
             winningTeam: normalizedWinner,
             summary: this.buildHistorySummary(room, winner, players),
             winners,
-            players,
+            players: playersWithPoints,
+            pointsByPlayer: pointsByPlayer,
+            resultColor,
+            gameCounters: {
+                hunterKillsById: room.roleState && room.roleState.hunterKillsById ? room.roleState.hunterKillsById : {},
+                hunterAlphaKillsById: room.roleState && room.roleState.hunterAlphaKillsById ? room.roleState.hunterAlphaKillsById : {},
+                witchKillsById: room.roleState && room.roleState.witchKillsById ? room.roleState.witchKillsById : {},
+                witchAlphaKillsById: room.roleState && room.roleState.witchAlphaKillsById ? room.roleState.witchAlphaKillsById : {},
+                cupidoKillsById: room.roleState && room.roleState.cupidoKillsById ? room.roleState.cupidoKillsById : {},
+                cupidoAlphaKillsById: room.roleState && room.roleState.cupidoAlphaKillsById ? room.roleState.cupidoAlphaKillsById : {},
+                doctorHealsCountById: room.roleState && room.roleState.doctorHealsCountById ? room.roleState.doctorHealsCountById : {},
+                guardSuccessfulDefensesById: room.roleState && room.roleState.guardSuccessfulDefensesById ? room.roleState.guardSuccessfulDefensesById : {},
+                seerRevealedWolvesById: room.roleState && room.roleState.seerRevealedWolvesById ? room.roleState.seerRevealedWolvesById : {},
+                ancianoLivesById: room.roleState && room.roleState.ancianoLivesById ? room.roleState.ancianoLivesById : {},
+                wildChildModelId: room.roleState && room.roleState.wildChildModelId ? room.roleState.wildChildModelId : null
+            },
             storyEvents: room.getEventLog().slice(-20).map((entry) => ({
                 timestamp: entry.timestamp,
                 message: entry.message
@@ -256,15 +297,17 @@ class LobbyServer {
             return;
         }
 
-        // persist history first
-        this.persistRoomHistory(room, winner);
-
-        // compute and award points according to rules, then notify players
+        // compute and award points according to rules, capture them for history
+        let pointsMap = {};
         try {
-            this.computeAndAwardPoints(room, winner);
+            pointsMap = this.computeAndAwardPoints(room, winner) || {};
+            room.lastGamePoints = pointsMap;
         } catch (e) {
             console.error("Error awarding points:", e && e.message);
         }
+
+        // persist history now that we have points
+        this.persistRoomHistory(room, winner);
 
         room.finishGameToLobby(message);
     }
@@ -274,82 +317,172 @@ class LobbyServer {
         const normalizedWinner = this.normalizeWinnerForHistory(winner);
         const pointsByUser = new Map();
 
-        // helper to add points to a player object
         const add = (player, amount) => {
             if (!player || !player.name) return;
             const cur = pointsByUser.get(player.name) || 0;
             pointsByUser.set(player.name, cur + (Number(amount) || 0));
         };
 
-        // base team scoring
+        // 1) Base team scoring according to Normas
         room.players.forEach((player) => {
             const role = room.playerRoles[player.id] || "Desconocido";
             const isWolf = room.isWolfRole(role);
             const alive = player.isAlive !== false;
 
             if (normalizedWinner === "village") {
-                if (!isWolf) add(player, alive ? 2 : 1);
+                // village and listed good special roles get 2 if alive, 1 if dead
+                if (!isWolf && role !== 'Suicida' && role !== 'Superviviente') {
+                    add(player, alive ? 2 : 1);
+                }
+                // Superviviente handled below
             } else if (normalizedWinner === "wolves") {
                 if (isWolf) {
                     if (alive) {
-                        // base 3 for alive wolves
-                        let pts = 3;
-                        // Lobo Alfa bonus: +1 if did NOT use its conversion power
+                        let pts = 3; // alive wolves base
                         if (role === "Lobo Alfa") {
                             const used = room.roleState && room.roleState.wolfAlphaUsedById && room.roleState.wolfAlphaUsedById[player.id];
-                            pts += used ? 0 : 1;
+                            pts = used ? 3 : 4; // alpha: 4 if not used, else 3
                         }
                         add(player, pts);
                     } else {
-                        add(player, 1);
+                        add(player, 1); // dead wolves
                     }
                 }
             }
         });
 
-        // lone wolf special: if the only surviving wolf is a Lobo Solitario, award 5 points
+        // 2) Lone wolf special
         try {
             const aliveWolves = room.players.filter((p) => p.isAlive !== false && room.isWolfRole(room.playerRoles[p.id]));
             if (aliveWolves.length === 1) {
                 const lone = aliveWolves[0];
-                if (room.playerRoles[lone.id] === "Lobo Solitario") {
-                    add(lone, 5); // per rules
-                }
+                if (room.playerRoles[lone.id] === "Lobo Solitario") add(lone, 5);
             }
         } catch (e) {}
 
-        // hunter extra: hunters who used their shot and killed a wolf get +1 (or +2 if target was alpha)
+        // 3) Role-specific bonuses deduced from room state and death causes
         try {
-            const hunterIds = Object.keys(room.roleState.hunterShotUsedById || {}).filter((id) => room.roleState.hunterShotUsedById[id]);
-            if (hunterIds.length) {
-                // find players with death cause 'disparo del cazador'
-                for (const [playerId, cause] of Object.entries(room.deathCauseByPlayerId || {})) {
-                    if (String(cause || "").toLowerCase().includes('disparo')) {
-                        const targetPlayer = room.getPlayerById(playerId);
-                        if (targetPlayer && room.isWolfRole(room.playerRoles[playerId])) {
-                            // award each hunter who used their shot one extra point
-                            hunterIds.forEach((hid) => {
-                                const hunter = room.getPlayerById(hid);
-                                if (hunter) {
-                                    let extra = 1;
-                                    if (room.playerRoles[playerId] === 'Lobo Alfa') extra = 2;
-                                    add(hunter, extra);
-                                }
-                            });
-                        }
+            // a) Hunter: +1 per wolf killed, +1 extra per alpha killed
+            const hunterKills = room.roleState && room.roleState.hunterKillsById ? room.roleState.hunterKillsById : {};
+            const hunterAlpha = room.roleState && room.roleState.hunterAlphaKillsById ? room.roleState.hunterAlphaKillsById : {};
+            for (const [hid, kills] of Object.entries(hunterKills || {})) {
+                const hunter = room.getPlayerById(hid);
+                if (!hunter) continue;
+                add(hunter, Number(kills || 0));
+                const alphaCnt = Number(hunterAlpha[hid] || 0);
+                if (alphaCnt) add(hunter, alphaCnt); // +1 extra per alpha
+            }
+
+            // b) Witch: +1 per wolf poisoned, +1 extra per alpha poisoned (use counters)
+            try {
+                const witchKills = room.roleState && room.roleState.witchKillsById ? room.roleState.witchKillsById : {};
+                const witchAlpha = room.roleState && room.roleState.witchAlphaKillsById ? room.roleState.witchAlphaKillsById : {};
+                for (const [wid, cnt] of Object.entries(witchKills || {})) {
+                    const w = room.getPlayerById(wid);
+                    if (!w) continue;
+                    add(w, Number(cnt || 0));
+                    const a = Number(witchAlpha[wid] || 0);
+                    if (a) add(w, a);
+                }
+            } catch (e) {}
+
+            // c) Cazador extra handled via hunter logic above (same as hunter)
+
+            // d) Cupido: +1 per wolf death caused by Cupido, +1 extra per alpha (use counters)
+            try {
+                const cupKills = room.roleState && room.roleState.cupidoKillsById ? room.roleState.cupidoKillsById : {};
+                const cupAlpha = room.roleState && room.roleState.cupidoAlphaKillsById ? room.roleState.cupidoAlphaKillsById : {};
+                for (const [cid, cnt] of Object.entries(cupKills || {})) {
+                    const c = room.getPlayerById(cid);
+                    if (!c) continue;
+                    add(c, Number(cnt || 0));
+                    const a = Number(cupAlpha[cid] || 0);
+                    if (a) add(c, a);
+                }
+            } catch (e) {}
+
+            // e) Anciano: if Anciano ends with two lives left, +1
+            room.players.forEach((player) => {
+                const role = room.playerRoles[player.id] || '';
+                if (role === 'Anciano') {
+                    const lives = Number((room.roleState && room.roleState.ancianoLivesById && room.roleState.ancianoLivesById[player.id]) || 0);
+                    if (lives >= 2 && player.isAlive !== false) add(player, 1);
+                }
+            });
+
+            // f) Vidente: if a seer revealed all wolves across the game -> +1
+            try {
+                const totalWolves = Object.values(room.playerRoles || {}).filter((r) => room.isWolfRole(r)).length;
+                const seerReveals = room.roleState && room.roleState.seerRevealsById ? room.roleState.seerRevealsById : {};
+                const seerRevealedWolves = room.roleState && room.roleState.seerRevealedWolvesById ? room.roleState.seerRevealedWolvesById : {};
+                for (const seerId of Object.keys(seerReveals || {})) {
+                    const seerPlayer = room.getPlayerById(seerId);
+                    if (!seerPlayer) continue;
+                    const revealedWolves = Number(seerRevealedWolves[seerId] || 0);
+                    if (revealedWolves >= totalWolves && revealedWolves > 0) add(seerPlayer, 1);
+                }
+            } catch (e) {}
+
+            // g) Doctor: if doctor healed 3 good players -> +1
+            try {
+                const doctorHeals = room.roleState && room.roleState.doctorHealsCountById ? room.roleState.doctorHealsCountById : {};
+                for (const [docId, cnt] of Object.entries(doctorHeals || {})) {
+                    const doc = room.getPlayerById(docId);
+                    if (!doc) continue;
+                    if (Number(cnt || 0) >= 3) add(doc, 1);
+                }
+            } catch (e) {}
+
+            // h) Guardia: if guard successfully defended two or more times -> +1
+            try {
+                const guardDefs = room.roleState && room.roleState.guardSuccessfulDefensesById ? room.roleState.guardSuccessfulDefensesById : {};
+                for (const [gid, cnt] of Object.entries(guardDefs || {})) {
+                    const g = room.getPlayerById(gid);
+                    if (!g) continue;
+                    if (Number(cnt || 0) >= 2) add(g, 1);
+                }
+            } catch (e) {}
+
+            // i) Nino Salvaje: if selected model didn't die and didn't transform, award +1 extra when village wins
+            try {
+                const modelId = room.roleState && room.roleState.wildChildModelId;
+                if (modelId) {
+                    const modelPlayer = room.getPlayerById(modelId);
+                    const wildChildPlayer = (room.players || []).find((p) => room.playerRoles[p.id] === 'Nino Salvaje');
+                    if (modelPlayer && wildChildPlayer) {
+                        const modelAlive = modelPlayer.isAlive !== false;
+                        const wildChildTransformed = room.playerRoles[wildChildPlayer.id] && room.playerRoles[wildChildPlayer.id] !== 'Nino Salvaje';
+                        if (modelAlive && !wildChildTransformed && normalizedWinner === 'village') add(wildChildPlayer, 1);
                     }
                 }
-            }
+            } catch (e) {}
+
+            // j) Neutrals: Suicida and Superviviente
+            room.players.forEach((player) => {
+                const role = room.playerRoles[player.id] || '';
+                if (role === 'Superviviente') {
+                    if (player.isAlive !== false) add(player, 3);
+                }
+                if (role === 'Suicida') {
+                    if (player.isAlive === false) {
+                        let n = 0;
+                        try {
+                            const cd = Array.isArray(room.cumulativeDeaths) ? room.cumulativeDeaths.find((d) => d.id === player.id) : null;
+                            n = cd && cd.night ? Number(cd.night) : Number(room.nightNumber || 0);
+                        } catch (e) { n = Number(room.nightNumber || 0); }
+                        if (n === 1) add(player, 3);
+                        else if (n === 2) add(player, 2);
+                        else if (n === 3) add(player, 1);
+                    }
+                }
+            });
         } catch (e) {}
 
-        // apply points to users and notify via websocket
+        // 4) Persist points and notify players
         pointsByUser.forEach((pts, username) => {
-            try {
-                this.userManager.addPoints(username, pts);
-            } catch (e) {}
+            try { this.userManager.addPoints(username, pts); } catch (e) {}
         });
 
-        // notify each player with their awarded points and total
         room.players.forEach((player) => {
             try {
                 const username = player.name;
@@ -357,10 +490,16 @@ class LobbyServer {
                 const user = this.userManager.getUser(username);
                 const total = user ? (user.points || 0) : 0;
                 if (player.ws && player.ws.readyState === 1) {
-                    player.ws.send(JSON.stringify({ type: 'pointsAward', pointsGained: pts, totalPoints: total, message: `Has ganado ${pts} puntos` }));
+                    player.ws.send(JSON.stringify({ type: 'pointsAward', pointsGained: pts, totalPoints: total, message: pts ? `Has ganado ${pts} puntos` : '' }));
                 }
             } catch (e) {}
         });
+            try {
+                // return a plain object mapping username -> points awarded for history
+                return Object.fromEntries(pointsByUser.entries());
+            } catch (e) {
+                return {};
+            }
     }
 
     startNightPhase(roomCode) {
