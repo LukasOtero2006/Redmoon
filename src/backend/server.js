@@ -821,6 +821,7 @@ class LobbyServer {
         const result = room.resolveVotes();
 
         if (result.expelled) {
+            this.sendPlayerList(room);
             this.sendRoomState(room);
             this.broadcast(room, {
                 type: "voteResult",
@@ -920,7 +921,7 @@ class LobbyServer {
             type: "gameCinematic",
             durationMs: 9000,
             title: "Historia inicial",
-            text: "Dibujo animado: lobos persiguen a los aldeanos mientras el pueblo medieval cae en la oscuridad..."
+            text: "Lobos persiguen a los aldeanos mientras el pueblo medieval cae en la oscuridad..."
         });
 
         this.setRoomTimer(room.code, () => this.startNightPhase(room.code), 9000);
@@ -969,7 +970,7 @@ class LobbyServer {
         try {
             return JSON.parse(data.toString());
         } catch {
-            ws.send(JSON.stringify({ type: "error", message: "Mensaje invalido" }));
+            ws.send(JSON.stringify({ type: "error", message: "No se pudo procesar la peticion. Vuelve a intentarlo." }));
             return null;
         }
     }
@@ -982,31 +983,7 @@ class LobbyServer {
         }
 
         if (msg.type === "register") {
-            const username = String(msg.username || "").trim();
-            const email = String(msg.email || "").trim().toLowerCase();
-            const password = String(msg.password || "").trim();
-
-            if (!username || !email || !password) {
-                ws.send(JSON.stringify({ type: "error", message: "Rellena todos los campos" }));
-                return;
-            }
-
-            if (username.length < 3) {
-                ws.send(JSON.stringify({ type: "error", message: "Usuario: minimo 3 caracteres" }));
-                return;
-            }
-
-            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-                ws.send(JSON.stringify({ type: "error", message: "Email invalido" }));
-                return;
-            }
-
-            if (password.length < 6) {
-                ws.send(JSON.stringify({ type: "error", message: "Contrasena: minimo 6 caracteres" }));
-                return;
-            }
-
-            const result = this.userManager.register(username, email, password);
+            const result = this.userManager.register(msg.username, msg.email, msg.password);
 
             if (!result.success) {
                 ws.send(JSON.stringify({ type: "error", message: result.message }));
@@ -1022,7 +999,7 @@ class LobbyServer {
             const password = String(msg.password || "").trim();
 
             if (!identifier || !password) {
-                ws.send(JSON.stringify({ type: "error", message: "Usuario/email y contrasena requeridos" }));
+                ws.send(JSON.stringify({ type: "error", message: "Rellena usuario y contrasena" }));
                 return;
             }
 
@@ -1672,7 +1649,7 @@ class LobbyServer {
                 }));
             }
 
-            ws.send(JSON.stringify({ type: "info", message: "Solicitud enviada" }));
+            ws.send(JSON.stringify({ type: "friendRequestSent", toUser: { userId: targetUser.userId, username: targetUser.username } }));
             return;
         }
 
