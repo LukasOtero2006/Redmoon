@@ -1933,6 +1933,11 @@ class LobbyServer {
     handleClose(ws) {
         if (ws.session && ws.session.userId) {
             const userId = ws.session.userId;
+            const mappedSocket = this.playerSessions.get(userId);
+
+            if (mappedSocket && mappedSocket !== ws) {
+                return;
+            }
 
             // start a short grace period to allow reconnects
             if (this.disconnectTimers.has(userId)) {
@@ -1942,14 +1947,16 @@ class LobbyServer {
             const t = setTimeout(() => {
                 // if still not reconnected, remove session and from room
                 const mapped = this.playerSessions.get(userId);
-                if (!mapped) {
+                if (!mapped || mapped === ws) {
                     this.removePlayerFromRoom(ws);
                 }
                 this.disconnectTimers.delete(userId);
             }, 60 * 1000);
 
             this.disconnectTimers.set(userId, t);
-            this.playerSessions.delete(userId);
+            if (this.playerSessions.get(userId) === ws) {
+                this.playerSessions.delete(userId);
+            }
         } else {
             this.removePlayerFromRoom(ws);
         }
