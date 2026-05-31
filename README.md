@@ -56,6 +56,8 @@ Interfaz de Día (debate y votación)
 
 Indicadores visuales de fase
 
+Implementar diferentes idiomas
+
 Feedback visual para acciones (seleccionar, confirmar, votar)
 
 Diseño coherente con la temática del juego
@@ -65,6 +67,12 @@ Resultado: el juego se puede jugar visualmente de principio a fin con una interf
 
 ## Sprint 5 – Objetivo
 Pulir, optimizar y preparar la versión final del proyecto.
+
+Historial de logs del host
+
+Mejoras de interfaz
+
+Complementar completamente los idiomas a todas las salas 
 
 Reconexión automática de jugadores
 
