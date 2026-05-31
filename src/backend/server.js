@@ -5,6 +5,7 @@ import { UserManager } from "./classes/UserManager.js";
 import { GameHistory } from "./classes/GameHistory.js";
 
 const wss = new WebSocketServer({ port: 3000 });
+const HEARTBEAT_INTERVAL_MS = 30000;
 
 class LobbyServer {
     constructor(server) {
@@ -14,6 +15,7 @@ class LobbyServer {
         this.playerSessions = new Map();
         this.roomTimers = new Map();
         this.disconnectTimers = new Map();
+        this.heartbeatInterval = null;
     }
 
     broadcast(room, message) {
@@ -958,12 +960,32 @@ class LobbyServer {
 
     start() {
         this.wss.on("connection", (ws) => {
+            ws.isAlive = true;
+            ws.on("pong", () => {
+                ws.isAlive = true;
+            });
             ws.session = null;
             console.log("[SERVER] Nueva conexion WebSocket establecida");
 
             ws.on("message", (data) => this.handleMessage(ws, data));
             ws.on("close", () => this.handleClose(ws));
         });
+
+        this.heartbeatInterval = setInterval(() => {
+            this.wss.clients.forEach((client) => {
+                if (client.isAlive === false) {
+                    client.terminate();
+                    return;
+                }
+
+                client.isAlive = false;
+                client.ping();
+            });
+        }, HEARTBEAT_INTERVAL_MS);
+
+        if (typeof this.heartbeatInterval.unref === "function") {
+            this.heartbeatInterval.unref();
+        }
     }
 
     parseMessage(ws, data) {
