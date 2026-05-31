@@ -42,3 +42,40 @@ Muertes
 Votaciones
 
 Avance automático de turnos
+
+## Sprint 4 – Objetivo
+Completar toda la interfaz del juego y hacerla totalmente funcional.
+
+Pantalla de lobby con jugadores conectados
+
+Pantalla privada de rol para cada jugador
+
+Interfaz de Noche (acciones de roles)
+
+Interfaz de Día (debate y votación)
+
+Indicadores visuales de fase
+
+Feedback visual para acciones (seleccionar, confirmar, votar)
+
+Diseño coherente con la temática del juego
+
+Resultado: el juego se puede jugar visualmente de principio a fin con una interfaz clara.
+
+
+## Sprint 5 – Objetivo
+Pulir, optimizar y preparar la versión final del proyecto.
+
+Reconexión automática de jugadores
+
+Logs para el host con eventos importantes
+
+Optimización del servidor y reducción de latencia
+
+Manejo de errores y mensajes claros
+
+Ajustes finales de interfaz y experiencia de usuario
+
+Preparación para despliegue (hosting)
+
+Resultado: versión final estable, optimizada y lista para entrega.
